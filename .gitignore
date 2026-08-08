@@ -28,3 +28,7 @@ web/tsconfig.tsbuildinfo
 
 # SPEC is internal, not tracked
 SPEC.md
+
+# Agent guidance is local, not tracked
+CLAUDE.md
+.claude/

@@ -120,6 +120,10 @@ type managed struct {
 	downKbps    int64
 	upKbps      int64
 
+	// dropped guards against disposing of the underlying torrent twice, which
+	// anacrolix punishes with an "already closed" panic (lifecycle.go).
+	dropped bool
+
 	// keepSeed accounting (persisted so ratio/time survive restarts, SPEC §8).
 	baseUp         int64     // bytes uploaded in prior sessions
 	baseDown       int64     // bytes downloaded in prior sessions
@@ -202,6 +206,10 @@ type Engine struct {
 
 	mu      sync.Mutex
 	managed map[string]*managed
+
+	// Per-infohash serialization for add/drop/delete (lifecycle.go).
+	hashMu    sync.Mutex
+	hashLocks map[string]*hashLock
 }
 
 // New builds the anacrolix client from settings and returns an Engine.
@@ -259,6 +267,7 @@ func New(store *config.Store) (*Engine, error) {
 		downLimiter: downLimiter,
 		upLimiter:   upLimiter,
 		managed:     map[string]*managed{},
+		hashLocks:   map[string]*hashLock{},
 	}
 	e.ApplyRateLimits(cfg.Net)
 	e.startSeedEnforcer() // keepSeed ratio/time enforcement (SPEC §6.4)
@@ -309,7 +318,7 @@ func setLimiter(l *rate.Limiter, kbps int) {
 func (e *Engine) Close() {
 	e.mu.Lock()
 	for _, m := range e.managed {
-		m.t.Drop()
+		e.dropManaged(m) // idempotent: a racing drop may have got here first
 	}
 	e.managed = map[string]*managed{}
 	e.mu.Unlock()
@@ -347,10 +356,16 @@ func (e *Engine) Add(ctx context.Context, link string) (*AddResult, error) {
 		return nil, err
 	}
 
+	// Serialize against any other add/drop/delete of this infohash: a Drop that
+	// has already left e.managed but not yet closed its torrent would otherwise
+	// hand us that same torrent back from AddTorrentSpec (lifecycle.go).
+	hash0 := spec.InfoHash.HexString()
+	release := e.lockHash(hash0)
+	defer release()
+
 	// Idempotent (SPEC §5): if this torrent is already active, return it as-is —
 	// never restart its download. anacrolix keeps verifying/resuming/seeding the
 	// existing data. Re-adds (LumoraTV polling, pack episodes, restarts) are no-ops.
-	hash0 := spec.InfoHash.HexString()
 	e.mu.Lock()
 	existing, ok := e.managed[hash0]
 	e.mu.Unlock()
@@ -465,10 +480,16 @@ func (e *Engine) Add(ctx context.Context, link string) (*AddResult, error) {
 		t.SetMaxEstablishedConns(dec.MaxConns)
 	}
 
-	e.mu.Lock()
-	e.managed[hash] = m
-	e.enforceActiveLimitLocked(cfg.Limits.MaxActiveTorrents)
-	e.mu.Unlock()
+	// Deferred unlock, not a bare one: a panic in the sweep would otherwise leave
+	// e.mu held forever. net/http recovers the panic and only that request dies,
+	// but every later List/Get/Add/stream blocks on the orphaned lock — the whole
+	// server goes silent while the container still looks healthy.
+	func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.managed[hash] = m
+		e.enforceActiveLimitLocked(cfg.Limits.MaxActiveTorrents)
+	}()
 
 	_ = e.store.SaveTorrent(config.TorrentRecord{
 		Hash: hash, Link: link, Name: t.Name(), AddedAt: m.addedAt.Unix(),
@@ -514,7 +535,9 @@ func (e *Engine) enforceActiveLimitLocked(max int) {
 		victim := idle[0]
 		idle = idle[1:]
 		if m, ok := e.managed[victim.hash]; ok {
-			m.t.Drop()
+			// e.mu is held, so the per-hash lock is off limits (lock ordering);
+			// dropManaged's idempotency is what keeps this safe.
+			e.dropManaged(m)
 			delete(e.managed, victim.hash)
 		}
 	}
@@ -728,6 +751,10 @@ func (e *Engine) statsOf(m *managed) Stats {
 
 // Drop releases peers + cache but keeps metadata for instant re-add (SPEC §5).
 func (e *Engine) Drop(hash string) error {
+	// Held across both the map removal and the close, so a concurrent Add can't
+	// adopt the torrent we are about to dispose of (lifecycle.go).
+	defer e.lockHash(hash)()
+
 	e.mu.Lock()
 	m, ok := e.managed[hash]
 	if ok {
@@ -737,12 +764,14 @@ func (e *Engine) Drop(hash string) error {
 	if !ok {
 		return nil
 	}
-	m.t.Drop()
+	e.dropManaged(m)
 	return nil
 }
 
 // Delete removes the torrent and optionally its on-disk files (SPEC §5).
 func (e *Engine) Delete(hash string, withFiles bool) error {
+	defer e.lockHash(hash)() // see Drop
+
 	e.mu.Lock()
 	m, ok := e.managed[hash]
 	if ok {
@@ -752,7 +781,7 @@ func (e *Engine) Delete(hash string, withFiles bool) error {
 
 	rec, found := e.store.GetTorrent(hash)
 	if ok {
-		m.t.Drop()
+		e.dropManaged(m)
 	}
 	_ = e.store.DeleteTorrent(hash)
 

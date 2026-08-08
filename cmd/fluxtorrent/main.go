@@ -34,6 +34,10 @@ func main() {
 	}
 	defer store.Close()
 
+	// Bound the heap before the engine allocates anything: the RAM cache is the
+	// dominant consumer and must not grow into a container OOM kill (memlimit.go).
+	applyMemoryLimit(store.Get())
+
 	eng, err := engine.New(store)
 	if err != nil {
 		log.Fatalf("engine: %v", err)

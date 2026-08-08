@@ -1,7 +1,9 @@
 services:
   fluxtorrent:
-    build: .
-    image: fluxtorrent:latest
+    image: ghcr.io/jodacame/fluxtorrent:latest
+    # Building from source instead of pulling the published image? Uncomment
+    # the line below and run `docker compose up -d --build`.
+    # build: .
     container_name: fluxtorrent
     ports:
       - "7001:7001"        # API + UI + stream (bound 0.0.0.0)
@@ -17,13 +19,20 @@ services:
       - FT_AUTH_PASSWORD=        # set to require a UI login (empty = open)
       - FT_API_TOKEN=            # optional bearer token for machine clients
     restart: unless-stopped
+    # /api/health stays reachable without credentials even when FT_AUTH_PASSWORD
+    # is set, so this keeps working on a locked-down instance.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${FT_LISTEN_PORT:-7001}/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     # ultra-light service: small image, low idle RAM, restarts cleanly.
     # In RAM mode budget ~1.5x FT_CACHE_SIZE_MB: the cap covers piece payload
     # only, while pieces in flight and per-peer buffers add on top. FluxTorrent
     # reads this limit at boot and bounds its heap accordingly, so a cache that
     # is too large for the container is clamped (and logged) instead of being
     # OOM-killed mid-playback.
-    deploy:
-      resources:
-        limits:
-          memory: 1536M          # for FT_CACHE_SIZE_MB=1024
+    # (Swarm users: `deploy.resources.limits.memory` instead — `docker compose`
+    # ignores that block outside a stack, which is why the limit lives here.)
+    mem_limit: 1536m           # for FT_CACHE_SIZE_MB=1024

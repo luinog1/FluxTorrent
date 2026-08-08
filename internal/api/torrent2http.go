@@ -23,6 +23,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/jodacame/fluxtorrent/internal/engine"
 )
 
 func (s *Server) registerTorrent2HTTP(mux *http.ServeMux) {
@@ -32,28 +34,30 @@ func (s *Server) registerTorrent2HTTP(mux *http.ServeMux) {
 	mux.HandleFunc("GET /get/{index}", s.t2hGet)
 }
 
-// currentHash resolves the torrent a torrent2http request targets.
-func (s *Server) currentHash(r *http.Request) (string, bool) {
+// currentTorrent resolves the torrent a torrent2http request targets, returning
+// the snapshot itself rather than a hash to look up again: a torrent can be
+// dropped between the two calls (drop-after-playback fires the moment the last
+// reader closes), and a second lookup would then hand the handlers a nil Info.
+func (s *Server) currentTorrent(r *http.Request) (*engine.Info, bool) {
 	if h := r.URL.Query().Get("hash"); h != "" {
-		if _, ok := s.eng.Get(h); ok {
-			return h, true
+		if info, ok := s.eng.Get(h); ok {
+			return info, true
 		}
 	}
 	list := s.eng.List() // sorted newest-first
 	if len(list) == 0 {
-		return "", false
+		return nil, false
 	}
-	return list[0].Hash, true
+	return &list[0], true
 }
 
 // GET /status — session/torrent status.
 func (s *Server) t2hStatus(w http.ResponseWriter, r *http.Request) {
-	hash, ok := s.currentHash(r)
+	info, ok := s.currentTorrent(r)
 	if !ok {
 		writeJSON(w, http.StatusOK, map[string]any{"state": -1, "state_str": "Idle"})
 		return
 	}
-	info, _ := s.eng.Get(hash)
 	state, stateStr := t2hState(info.Stats.State)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":          info.Name,
@@ -70,12 +74,11 @@ func (s *Server) t2hStatus(w http.ResponseWriter, r *http.Request) {
 
 // GET /ls — file list.
 func (s *Server) t2hLs(w http.ResponseWriter, r *http.Request) {
-	hash, ok := s.currentHash(r)
+	info, ok := s.currentTorrent(r)
 	if !ok {
 		writeJSON(w, http.StatusOK, map[string]any{"files": []any{}})
 		return
 	}
-	info, _ := s.eng.Get(hash)
 	files := make([]map[string]any, 0, len(info.Files))
 	var offset int64
 	for _, f := range info.Files {
@@ -86,7 +89,7 @@ func (s *Server) t2hLs(w http.ResponseWriter, r *http.Request) {
 			"download": int64(info.Stats.Progress * float64(f.SizeB)),
 			"progress": info.Stats.Progress * 100,
 			// stable stream URL by index for clients that build their own links
-			"url": "/get/" + strconv.Itoa(f.Index) + "?hash=" + hash,
+			"url": "/get/" + strconv.Itoa(f.Index) + "?hash=" + info.Hash,
 		})
 		offset += f.SizeB
 	}
@@ -95,16 +98,15 @@ func (s *Server) t2hLs(w http.ResponseWriter, r *http.Request) {
 
 // GET /files/{path...} — stream a file by its path.
 func (s *Server) t2hFiles(w http.ResponseWriter, r *http.Request) {
-	hash, ok := s.currentHash(r)
+	info, ok := s.currentTorrent(r)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "no active torrent")
 		return
 	}
-	info, _ := s.eng.Get(hash)
 	want := strings.TrimPrefix(r.PathValue("path"), "/")
 	for _, f := range info.Files {
 		if f.Path == want || strings.HasSuffix(f.Path, want) {
-			s.serveStream(w, r, hash, f.Index)
+			s.serveStream(w, r, info.Hash, f.Index)
 			return
 		}
 	}
@@ -113,7 +115,7 @@ func (s *Server) t2hFiles(w http.ResponseWriter, r *http.Request) {
 
 // GET /get/{index} — stream a file by 0-based index.
 func (s *Server) t2hGet(w http.ResponseWriter, r *http.Request) {
-	hash, ok := s.currentHash(r)
+	info, ok := s.currentTorrent(r)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "no active torrent")
 		return
@@ -123,7 +125,7 @@ func (s *Server) t2hGet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "index must be an integer")
 		return
 	}
-	s.serveStream(w, r, hash, idx)
+	s.serveStream(w, r, info.Hash, idx)
 }
 
 // t2hState maps an engine state to torrent2http's numeric state + string.

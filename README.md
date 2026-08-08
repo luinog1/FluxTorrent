@@ -216,6 +216,28 @@ From the UI you can also tune: download/upload speed limits, max active torrents
 timeout, seeding defaults, the disk folder, and an **Advanced** section — DHT, connection
 limit, **force header encryption**, IPv6, µTP, and an idle **disconnect timeout**.
 
+### Memory budget (RAM mode)
+
+`FT_CACHE_SIZE_MB` caps the **piece payload** held in the ring buffer, not the whole process.
+Pieces still in flight, per-peer buffers and Go's heap add on top — the more peers a torrent
+has, the bigger that margin. On a well-seeded torrent resident memory settles at roughly
+**1.2–1.5×** the cap.
+
+FluxTorrent bounds its own heap accordingly at startup (`cache + 25%`), and clamps that to
+your container's memory limit if it can't fit, logging a warning rather than being
+OOM-killed mid-playback. Give the container about **1.5× the cache** and it stays clean:
+
+```yaml
+environment:
+  - FT_CACHE_SIZE_MB=1024
+deploy:
+  resources:
+    limits:
+      memory: 1536M     # ~1.5x the cache
+```
+
+Set `GOMEMLIMIT` explicitly if you'd rather pick the ceiling yourself.
+
 ### Authentication (`FT_AUTH_PASSWORD`)
 
 By default FluxTorrent is **open** — anyone who can reach the port uses it. Set

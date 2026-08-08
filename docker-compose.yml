@@ -17,8 +17,13 @@ services:
       - FT_AUTH_PASSWORD=        # set to require a UI login (empty = open)
       - FT_API_TOKEN=            # optional bearer token for machine clients
     restart: unless-stopped
-    # ultra-light service: small image, low idle RAM, restarts cleanly
+    # ultra-light service: small image, low idle RAM, restarts cleanly.
+    # In RAM mode budget ~1.5x FT_CACHE_SIZE_MB: the cap covers piece payload
+    # only, while pieces in flight and per-peer buffers add on top. FluxTorrent
+    # reads this limit at boot and bounds its heap accordingly, so a cache that
+    # is too large for the container is clamped (and logged) instead of being
+    # OOM-killed mid-playback.
     deploy:
       resources:
         limits:
-          memory: 1536M          # headroom over FT_CACHE_SIZE_MB in RAM mode
+          memory: 1536M          # for FT_CACHE_SIZE_MB=1024

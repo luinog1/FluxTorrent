@@ -27,12 +27,20 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 
 # ---------- stage 3: runtime (target arch) ----------
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+# su-exec lets the root entrypoint chown volumes and then drop to a non-root
+# UID/GID before exec'ing the binary (PID 1 preserved). ca-certificates is
+# required for HTTPS trackers / announce.
+RUN apk add --no-cache ca-certificates su-exec
 COPY --from=build /out/fluxtorrent /usr/local/bin/fluxtorrent
-# Runs as root so bind-mounted /config and /downloads "just work" regardless of
-# host ownership (standard for self-hosted media containers). Drop privileges
-# with `--user` / compose `user:` after chowning the volumes if you prefer.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+ && mkdir -p /config /downloads \
+ && chmod 1777 /config /downloads
+# Runs as root by default so bind-mounted /config and /downloads "just work"
+# on self-hosted setups. The entrypoint drops privileges via PUID/PGID when
+# set, and falls back to /tmp when the platform forces runAsNonRoot against
+# a root-owned /config (PaaS / managed K8s like runxbuild — see entrypoint).
 EXPOSE 7001 42069
 ENV FT_CONFIG_DIR=/config FT_LISTEN_HOST=0.0.0.0 FT_LISTEN_PORT=7001
 VOLUME ["/config", "/downloads"]
-ENTRYPOINT ["/usr/local/bin/fluxtorrent"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

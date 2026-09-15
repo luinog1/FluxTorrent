@@ -1,23 +1,33 @@
 services:
   fluxtorrent:
-    image: ghcr.io/jodacame/fluxtorrent:latest
-    # Building from source instead of pulling the published image? Uncomment
-    # the line below and run `docker compose up -d --build`.
-    # build: .
+    # Build from source (this fork's custom config: disk cache mode, 4GB cap,
+    # host port 7003 → container 7001). Pull the published image instead?
+    # Comment out `build`/`image` and use: image: ghcr.io/jodacame/fluxtorrent:latest
+    build: .
+    image: fluxtorrent:latest
     container_name: fluxtorrent
     ports:
-      - "7001:7001"        # API + UI + stream (bound 0.0.0.0)
+      - "7003:7001"        # API + UI + stream (bound 0.0.0.0)
       - "42069:42069"      # BT (optional, for incoming peers)
     volumes:
-      - ./config:/config         # bbolt db + settings
-      - ./downloads:/downloads   # disk-cache mode only
+      - ./config:/config                # bbolt db + settings
+      - ./downloads/flux-torrent:/downloads   # disk-cache mode root
     environment:
       - FT_LISTEN_HOST=0.0.0.0
       - FT_LISTEN_PORT=7001
-      - FT_CACHE_MODE=ram
-      - FT_CACHE_SIZE_MB=1024
+      - FT_CACHE_MODE=disk
+      - FT_CACHE_PATH=/downloads
+      - FT_CACHE_SIZE_MB=4096
+      - FT_READ_AHEAD_MB=128
+      - FT_HTTP_LOG=1
       - FT_AUTH_PASSWORD=        # set to require a UI login (empty = open)
       - FT_API_TOKEN=            # optional bearer token for machine clients
+      # Optional privilege drop for self-host (entrypoint chowns the volumes
+      # to this UID/GID, then execs the binary as it). Leave 0/0 to run as root.
+      # Ignored on platforms that force runAsNonRoot — the entrypoint detects
+      # non-writable /config and falls back to /tmp automatically.
+      - PUID=0
+      - PGID=0
     restart: unless-stopped
     # /api/health stays reachable without credentials even when FT_AUTH_PASSWORD
     # is set, so this keeps working on a locked-down instance.
@@ -27,12 +37,12 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
-    # ultra-light service: small image, low idle RAM, restarts cleanly.
-    # In RAM mode budget ~1.5x FT_CACHE_SIZE_MB: the cap covers piece payload
-    # only, while pieces in flight and per-peer buffers add on top. FluxTorrent
-    # reads this limit at boot and bounds its heap accordingly, so a cache that
-    # is too large for the container is clamped (and logged) instead of being
-    # OOM-killed mid-playback.
-    # (Swarm users: `deploy.resources.limits.memory` instead — `docker compose`
-    # ignores that block outside a stack, which is why the limit lives here.)
-    mem_limit: 1536m           # for FT_CACHE_SIZE_MB=1024
+    # Disk-cache mode at 4GB needs headroom for in-flight pieces, per-peer
+    # buffers, and Go's runtime — the cache cap is just the on-disk retained
+    # payload, not the whole process.
+    # (docker compose v2+ honors `deploy.resources.limits.memory` even outside
+    # a swarm stack; older docker-compose v1 needs `mem_limit` instead.)
+    deploy:
+      resources:
+        limits:
+          memory: 5120M
